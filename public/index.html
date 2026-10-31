@@ -622,25 +622,122 @@ const socket = io();
 
 // ── State ──
 let appState = {};
-let history = JSON.parse(localStorage.getItem('amd_history')||'[]');
-let alerts = JSON.parse(localStorage.getItem('amd_alerts')||'[]');
-let alertIdCounter = parseInt(localStorage.getItem('amd_alertIdCounter')||'0', 10);
+let history = [];
+let alerts = [];
+let alertIdCounter = 0;
 let scheduleConfig = [
   { chamber:1, medicine:'Medicine A', time:'08:00', dose:'1 tablet' },
   { chamber:2, medicine:'Medicine B', time:'12:00', dose:'1 tablet' },
   { chamber:3, medicine:'Medicine C', time:'16:00', dose:'1 tablet' },
   { chamber:4, medicine:'Medicine D', time:'20:00', dose:'1 tablet' }
 ];
-let patient = JSON.parse(localStorage.getItem('amd_patient')||'{"name":"Patient Name","id":"AMD-001","age":"","doctor":"","notes":""}');
-let notifPrefs = JSON.parse(localStorage.getItem('amd_notifPrefs')||'{"missed":true,"upcoming":true,"offline":true,"summary":false}');
+let patient = {name:'Patient Name',id:'AMD-001',age:'',doctor:'',notes:''};
+let notifPrefs = {missed:true,upcoming:true,offline:true,summary:false};
+let darkMode = false;
 let deviceWasOnline = null;
+let storageReady = false;
+let storageWriteQueue = Promise.resolve();
+
+function readLegacyValue(key, fallback) {
+  const value = localStorage.getItem(key);
+  if (value === null) return fallback;
+
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    console.error(`Could not read legacy browser data "${key}":`, error);
+    return fallback;
+  }
+}
+
+function getStorageSnapshot() {
+  return {
+    history,
+    alerts,
+    alertIdCounter,
+    patient,
+    notifPrefs,
+    darkMode
+  };
+}
 
 function saveLocalState() {
-  localStorage.setItem('amd_history', JSON.stringify(history));
-  localStorage.setItem('amd_alerts', JSON.stringify(alerts));
-  localStorage.setItem('amd_alertIdCounter', alertIdCounter.toString());
-  localStorage.setItem('amd_patient', JSON.stringify(patient));
-  localStorage.setItem('amd_notifPrefs', JSON.stringify(notifPrefs));
+  if (!storageReady) return;
+
+  const snapshot = getStorageSnapshot();
+  storageWriteQueue = storageWriteQueue.then(async () => {
+    const response = await fetch('/api/storage', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(snapshot)
+    });
+
+    if (!response.ok) {
+      throw new Error(`Storage save failed with HTTP ${response.status}`);
+    }
+  }).catch(error => {
+    console.error('Could not save dashboard data to database.db:', error);
+  });
+}
+
+function applyStorageState(data) {
+  history = data.history || [];
+  alerts = (data.alerts || []).map(alert => ({
+    ...alert,
+    time: new Date(alert.time)
+  }));
+  alertIdCounter = data.alertIdCounter || 0;
+  patient = data.patient || patient;
+  notifPrefs = data.notifPrefs || notifPrefs;
+  darkMode = data.darkMode === true;
+  if (Array.isArray(data.schedule) && data.schedule.length === 4) {
+    scheduleConfig = data.schedule;
+  }
+  setDarkMode(darkMode, false);
+}
+
+async function initializeStorage() {
+  const response = await fetch('/api/storage');
+  if (!response.ok) {
+    throw new Error(`Could not load database storage: HTTP ${response.status}`);
+  }
+
+  let data = await response.json();
+
+  if (!data.initialized) {
+    const legacyData = {
+      importLegacy: true,
+      history: readLegacyValue('amd_history', []),
+      alerts: readLegacyValue('amd_alerts', []),
+      alertIdCounter: readLegacyValue('amd_alertIdCounter', 0),
+      patient: readLegacyValue('amd_patient', patient),
+      notifPrefs: readLegacyValue('amd_notifPrefs', notifPrefs),
+      darkMode: readLegacyValue('amd_darkMode', false) === true
+    };
+
+    const importResponse = await fetch('/api/storage', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(legacyData)
+    });
+
+    if (!importResponse.ok) {
+      throw new Error(`Could not import browser data: HTTP ${importResponse.status}`);
+    }
+
+    data = await importResponse.json();
+  }
+
+  applyStorageState(data);
+  storageReady = true;
+  [
+    'amd_history',
+    'amd_alerts',
+    'amd_alertIdCounter',
+    'amd_patient',
+    'amd_notifPrefs',
+    'amd_darkMode'
+  ].forEach(key => localStorage.removeItem(key));
 }
 
 function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
@@ -1038,36 +1135,44 @@ function checkUpcoming(){
     }
   });
 }
-setInterval(checkUpcoming, 30000);
-setTimeout(checkUpcoming, 2000);
-
 // ── Socket & Init ──
-fetch('/api/state').then(r=>r.json()).then(s=>{
-  if(s.schedule) scheduleConfig = s.schedule.map(x=>({chamber:x.chamber, medicine:x.medicine, time:x.time, dose:x.dose}));
+setDarkMode(readLegacyValue('amd_darkMode', false) === true, false);
+initializeStorage().then(async ()=>{
+  socket.on('device:update', render);
+  socket.on('connect', ()=>{ document.getElementById('set-socketStatus')&&(document.getElementById('set-socketStatus').textContent='Connected'); });
+  socket.on('disconnect', ()=>{ document.getElementById('set-socketStatus')&&(document.getElementById('set-socketStatus').textContent='Disconnected'); });
+
+  await load();
+  await fetch('/api/state').then(r=>r.json()).then(s=>{
+    if(s.schedule) scheduleConfig = s.schedule.map(x=>({chamber:x.chamber, medicine:x.medicine, time:x.time, dose:x.dose}));
+  });
+
+  setInterval(checkUpcoming, 60000);
+  setTimeout(checkUpcoming, 2000);
+
+  setTimeout(()=>{
+    const today=new Date().toLocaleDateString();
+    let historyChanged=false;
+    if(appState.schedule){
+      appState.schedule.forEach(x=>{
+        const exists=history.find(h=>h.date===today&&h.chamber===x.chamber);
+        if(!exists&&(x.status==='TAKEN'||x.status==='MISSED')){
+          history.push({date:today,time:x.time,chamber:x.chamber,medicine:x.medicine,dose:x.dose,status:x.status,dispensedAt:x.status==='TAKEN'?new Date().toISOString():null});
+          historyChanged=true;
+        }
+      });
+    }
+    if(historyChanged) saveLocalState();
+  },2000);
+}).catch(error=>{
+  console.error('Could not initialize saved dashboard data:', error);
+  showToast('Could not load saved data from the database.');
 });
-socket.on('device:update', render);
-socket.on('connect', ()=>{ document.getElementById('set-socketStatus')&&(document.getElementById('set-socketStatus').textContent='Connected'); });
-socket.on('disconnect', ()=>{ document.getElementById('set-socketStatus')&&(document.getElementById('set-socketStatus').textContent='Disconnected'); });
-
-load();
-setInterval(checkUpcoming, 60000);
-
-// Seed today's default history from schedule on first load
-setTimeout(()=>{
-  const today=new Date().toLocaleDateString();
-  if(appState.schedule){
-    appState.schedule.forEach(x=>{
-      const exists=history.find(h=>h.date===today&&h.chamber===x.chamber);
-      if(!exists&&(x.status==='TAKEN'||x.status==='MISSED')){
-        history.push({date:today,time:x.time,chamber:x.chamber,medicine:x.medicine,dose:x.dose,status:x.status,dispensedAt:x.status==='TAKEN'?new Date().toISOString():null});
-      }
-    });
-  }
-},2000);
 // ══════════ DARK MODE FUNCTION ══════════
 
-function setDarkMode(enabled){
+function setDarkMode(enabled, persist=true){
   document.body.classList.toggle('dark-mode', enabled);
+  darkMode=enabled;
 
   const logo = document.getElementById('darkModeLogo');
   const text = document.getElementById('darkModeText');
@@ -1080,7 +1185,7 @@ function setDarkMode(enabled){
     text.textContent = 'Dark';
   }
 
-  localStorage.setItem('amd_darkMode', enabled ? 'true' : 'false');
+  if(persist) saveLocalState();
 }
 
 function toggleDarkMode(){
@@ -1088,11 +1193,6 @@ function toggleDarkMode(){
   setDarkMode(enabled);
 }
 
-// Remember selected mode after page refresh
-(function(){
-  const savedMode = localStorage.getItem('amd_darkMode') === 'true';
-  setDarkMode(savedMode);
-})();
 </script>
 </body>
 </html>

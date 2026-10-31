@@ -104,9 +104,10 @@ Start with one servo/button for testing before connecting all four.
 - Taken / Missed / Pending
 - Adherence percentage
 - Dashboard-side manual dispense control
+- SQLite persistence in `database.db` for schedules, doses, history, alerts, patient details, and preferences
 
-## Important limitation
+## Data persistence
 
-This first prototype keeps "taken today" in the Node.js server memory. If the server restarts, today's taken state resets.
+The dashboard saves its persistent data in the SQLite database file `database.db`. On the first load after this update, existing history, alerts, patient details, and preferences in browser storage are imported into the database. After that, the browser reads and saves this data through the server, so it remains available after restarts and across browsers.
 
-For the final SIH version, add Supabase/PostgreSQL so history, schedules, patient data and medicine inventory persist permanently.
+Keep `database.db` with the project when backing up or moving the dashboard.

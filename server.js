@@ -1,6 +1,9 @@
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const initSqlJs = require("sql.js");
 const { Server } = require("socket.io");
 
 const app = express();
@@ -14,10 +17,62 @@ const io = new Server(server, {
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 app.use(express.static("public"));
 
 const PORT = process.env.PORT || 3000;
+const DATABASE_PATH = path.join(__dirname, "database.db");
+const STORAGE_KEYS = [
+  "history",
+  "alerts",
+  "alertIdCounter",
+  "patient",
+  "notifPrefs",
+  "darkMode",
+  "schedule",
+  "esp32Url",
+  "takenToday"
+];
+let database;
+
+function readStoredValue(key, fallback) {
+  const rows = database.exec(
+    "SELECT value FROM app_data WHERE key = $key",
+    { $key: key }
+  );
+
+  if (!rows.length || !rows[0].values.length) {
+    return fallback;
+  }
+
+  return JSON.parse(rows[0].values[0][0]);
+}
+
+function writeStoredValues(values) {
+  database.run("BEGIN TRANSACTION");
+
+  try {
+    const statement = database.prepare(
+      "INSERT INTO app_data (key, value) VALUES ($key, $value) " +
+      "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    );
+
+    for (const [key, value] of Object.entries(values)) {
+      statement.run({
+        $key: key,
+        $value: JSON.stringify(value)
+      });
+    }
+
+    statement.free();
+    database.run("COMMIT");
+  } catch (error) {
+    database.run("ROLLBACK");
+    throw error;
+  }
+
+  fs.writeFileSync(DATABASE_PATH, Buffer.from(database.export()));
+}
 
 // =====================================================
 // ESP32 CONFIG
@@ -60,6 +115,8 @@ let schedule = [
   }
 ];
 
+const defaultSchedule = schedule;
+
 
 // =====================================================
 // DEVICE STATE
@@ -84,6 +141,36 @@ let lastDevice = {
 // =====================================================
 
 let takenToday = new Set();
+let takenTodayDate = new Date().toLocaleDateString();
+
+function getLocalDateKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function ensureCurrentTakenDate() {
+  const today = getLocalDateKey();
+
+  if (takenTodayDate !== today) {
+    takenTodayDate = today;
+    takenToday.clear();
+    writeStoredValues({
+      takenToday: { date: today, chambers: [] }
+    });
+  }
+}
+
+function persistTakenToday() {
+  takenTodayDate = getLocalDateKey();
+  writeStoredValues({
+    takenToday: {
+      date: takenTodayDate,
+      chambers: [...takenToday]
+    }
+  });
+}
 
 
 // =====================================================
@@ -113,6 +200,8 @@ function normalizeESP32URL(url) {
 
 
 function statusForDose(item, now = new Date()) {
+  ensureCurrentTakenDate();
+
   const [h, m] = item.time.split(":").map(Number);
 
   const scheduled = new Date(now);
@@ -173,17 +262,29 @@ async function fetchDevice() {
     // -------------------------------------------------
 
     if (Array.isArray(data.chambers)) {
+      let scheduleChanged = false;
+
       data.chambers.forEach(chamber => {
         const index = chamber.chamber - 1;
 
         if (
           index >= 0 &&
           index < schedule.length &&
-          chamber.schedule
+          chamber.schedule &&
+          schedule[index].time !== chamber.schedule
         ) {
           schedule[index].time = chamber.schedule;
+          scheduleChanged = true;
         }
       });
+
+      if (scheduleChanged) {
+        try {
+          writeStoredValues({ schedule });
+        } catch (error) {
+          console.error("Could not save ESP32 schedule:", error);
+        }
+      }
     }
 
     io.emit(
@@ -271,6 +372,118 @@ app.get("/api/state", (req, res) => {
 });
 
 
+function getStorageState() {
+  return {
+    initialized: readStoredValue("storageInitialized", false),
+    history: readStoredValue("history", []),
+    alerts: readStoredValue("alerts", []),
+    alertIdCounter: readStoredValue("alertIdCounter", 0),
+    patient: readStoredValue("patient", {
+      name: "Patient Name",
+      id: "AMD-001",
+      age: "",
+      doctor: "",
+      notes: ""
+    }),
+    notifPrefs: readStoredValue("notifPrefs", {
+      missed: true,
+      upcoming: true,
+      offline: true,
+      summary: false
+    }),
+    darkMode: readStoredValue("darkMode", false),
+    schedule: readStoredValue("schedule", defaultSchedule)
+  };
+}
+
+
+app.get("/api/storage", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json(getStorageState());
+});
+
+
+app.post("/api/storage", (req, res) => {
+  const body = req.body;
+
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return res.status(400).json({
+      ok: false,
+      error: "Storage data must be an object"
+    });
+  }
+
+  const isImport = body.importLegacy === true;
+
+  if (isImport && readStoredValue("storageInitialized", false)) {
+    return res.json({
+      ok: true,
+      imported: false,
+      ...getStorageState()
+    });
+  }
+
+  const values = {};
+
+  for (const key of STORAGE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) {
+      values[key] = body[key];
+    }
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(values, "history") &&
+    !Array.isArray(values.history)
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: "History must be an array"
+    });
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(values, "alerts") &&
+    !Array.isArray(values.alerts)
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: "Alerts must be an array"
+    });
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(values, "schedule") &&
+    (!Array.isArray(values.schedule) || values.schedule.length !== 4)
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: "Schedule must contain exactly 4 chambers"
+    });
+  }
+
+  try {
+    values.storageInitialized = true;
+    writeStoredValues(values);
+
+    if (values.schedule) {
+      schedule = values.schedule;
+    }
+
+    res.json({
+      ok: true,
+      imported: isImport,
+      ...getStorageState()
+    });
+  } catch (error) {
+    console.error("Could not save dashboard storage:", error);
+    res.status(500).json({
+      ok: false,
+      error: "Could not save dashboard data"
+    });
+  }
+});
+
+
 // =====================================================
 // ESP32 CONFIG API
 // =====================================================
@@ -301,10 +514,18 @@ app.post("/api/config", async (req, res) => {
 
   }
 
-  ESP32_URL = newURL;
+  try {
+    writeStoredValues({ esp32Url: newURL });
+  } catch (error) {
+    console.error("Could not save ESP32 configuration:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not save ESP32 configuration"
+    });
+  }
 
-  lastDevice.ip =
-    getESP32IP();
+  ESP32_URL = newURL;
+  lastDevice.ip = getESP32IP();
 
   await fetchDevice();
 
@@ -341,6 +562,18 @@ app.post("/api/schedule", async (req, res) => {
       error: "Exactly 4 chambers are required"
     });
 
+  }
+
+  try {
+    writeStoredValues({
+      schedule: newSchedule
+    });
+  } catch (error) {
+    console.error("Could not save schedule:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not save schedule"
+    });
   }
 
   schedule = newSchedule;
@@ -453,6 +686,18 @@ app.post("/api/schedule/:chamber", async (req, res) => {
     schedule[chamber - 1].time =
       time;
 
+    try {
+      writeStoredValues({
+        schedule
+      });
+    } catch (error) {
+      console.error("Could not save schedule:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "Could not save schedule"
+      });
+    }
+
     io.emit(
       "device:update",
       buildDashboardState()
@@ -521,7 +766,18 @@ app.post(
 
       }
 
+      ensureCurrentTakenDate();
       takenToday.add(chamber);
+
+      try {
+        persistTakenToday();
+      } catch (error) {
+        console.error("Could not save taken dose:", error);
+        return res.status(500).json({
+          ok: false,
+          error: "Could not save taken dose"
+        });
+      }
 
       io.emit(
         "device:update",
@@ -714,6 +970,16 @@ app.post("/api/reset-today", (req, res) => {
 
   takenToday.clear();
 
+  try {
+    persistTakenToday();
+  } catch (error) {
+    console.error("Could not reset today's doses:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not reset today's doses"
+    });
+  }
+
   io.emit(
     "device:update",
     buildDashboardState()
@@ -745,46 +1011,67 @@ io.on("connection", socket => {
 });
 
 
-// =====================================================
-// ESP32 POLLING
-// =====================================================
-
-setInterval(
-  fetchDevice,
-  1000
-);
-
-
-// =====================================================
-// INITIAL FETCH
-// =====================================================
-
-fetchDevice();
-
-
+// module.exports = server;
 // =====================================================
 // START SERVER
 // =====================================================
 
-server.listen(
-  PORT,
-  () => {
+async function initializeDatabase() {
+  const SQL = await initSqlJs({
+    locateFile: filename =>
+      path.join(path.dirname(require.resolve("sql.js")), filename)
+  });
 
-    console.log(
-      "===================================="
-    );
+  const savedDatabase =
+    fs.existsSync(DATABASE_PATH) &&
+    fs.statSync(DATABASE_PATH).size > 0
+      ? new Uint8Array(fs.readFileSync(DATABASE_PATH))
+      : undefined;
 
-    console.log(
-      `MEDINOSA Dashboard: http://localhost:${PORT}`
-    );
+  database = savedDatabase
+    ? new SQL.Database(savedDatabase)
+    : new SQL.Database();
 
-    console.log(
-      `ESP32 URL: ${ESP32_URL}`
-    );
+  database.run(
+    "CREATE TABLE IF NOT EXISTS app_data (" +
+    "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+  );
 
-    console.log(
-      "===================================="
-    );
+  schedule = readStoredValue("schedule", defaultSchedule);
 
+  const storedESP32URL = readStoredValue("esp32Url", null);
+  if (storedESP32URL) {
+    ESP32_URL = storedESP32URL;
   }
-);
+
+  const today = getLocalDateKey();
+  const storedTakenToday = readStoredValue("takenToday", null);
+
+  if (storedTakenToday?.date === today) {
+    takenTodayDate = today;
+    takenToday = new Set(storedTakenToday.chambers);
+  } else {
+    takenTodayDate = today;
+    takenToday.clear();
+  }
+
+  fs.writeFileSync(DATABASE_PATH, Buffer.from(database.export()));
+}
+
+initializeDatabase()
+  .then(() => {
+    setInterval(fetchDevice, 1000);
+    fetchDevice();
+
+    server.listen(PORT, () => {
+      console.log("====================================");
+      console.log(`MEDINOSA Dashboard: http://localhost:${PORT}`);
+      console.log(`ESP32 URL: ${ESP32_URL}`);
+      console.log(`SQLite database: ${DATABASE_PATH}`);
+      console.log("====================================");
+    });
+  })
+  .catch(error => {
+    console.error("Could not initialize SQLite database:", error);
+    process.exitCode = 1;
+  });
